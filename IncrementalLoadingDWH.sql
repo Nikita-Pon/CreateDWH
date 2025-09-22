@@ -1,10 +1,3 @@
---alter table film_src.inventory add column deleted timestamp OPTIONS(column_name 'deleted') null
---alter table staging.inventory add column deleted timestamp null;
-
-
--- создание staging слоя
--- создание таблиц staging слоя
-
 drop table if exists staging.last_update;
 
 create table staging.last_update (
