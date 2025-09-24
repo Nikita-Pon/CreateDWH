@@ -703,7 +703,9 @@ as $$
 			join core.dim_inventory i 
 				on r.inventory_id = i.inventory_id
 				and p.payment_date between i.effective_date_from and i.effective_date_to
-			join core.dim_staff s on p.staff_id = s.staff_id
+			join core.dim_staff s
+				 on p.staff_id = s.staff_id
+				and p.payment_date between s.effective_date_from and s.effective_date_to
 			join core.dim_date dd on dd.date_actual = p.payment_date::date;
 		
 	end;
@@ -734,7 +736,9 @@ as $$
 			join core.dim_inventory di 
 				on r.inventory_id = di.inventory_id
 				and r.rental_date between di.effective_date_from and di.effective_date_to
-			join core.dim_staff ds on r.staff_id = ds.staff_id
+			join core.dim_staff ds 
+				on r.staff_id = ds.staff_id
+				and r.rental_date between ds.effective_date_from and ds.effective_date_to
 			join core.dim_date dd1 on dd1.date_actual = r.rental_date::date
 			left join core.dim_date dd2 on dd2.date_actual = r.return_date::date
 			left join staging.payment p using(rental_id)
@@ -834,11 +838,11 @@ $$ language plpgsql;
 
 call core.load_date('2007-01-01'::date, 7000);
 call core.full_load();
-
-
-select * from core.dim_staff; 
-select * from staging.staff s;
-select * from staging.last_update;
+--
+--
+--select * from core.dim_staff; 
+--select * from staging.staff s;
+--select * from staging.last_update;
 --
 --select * from core.dim_inventory di order by inventory_id desc;  --film_id = 2
 --select count(*) from core.dim_inventory di;  --4591
