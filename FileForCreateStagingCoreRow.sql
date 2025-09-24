@@ -7,6 +7,7 @@
 --alter table core.dim_inventory add column effective_date_from timestamp default to_date('1900-01-01', 'yyyy-MM-hh') not null;
 --alter table core.dim_inventory add column effective_date_to timestamp default to_date('1900-01-01', 'yyyy-MM-hh') not null;
 --alter table core.dim_inventory add column is_active boolean default true not null;
+--ALTER TABLE core.dim_staff drop CONSTRAINT dim_staff_staff_id_key;
 
 --Создание таблиц staging слоя
 DROP TABLE if exists staging.last_update;
@@ -109,6 +110,7 @@ CREATE TABLE staging.staff (
 	first_name varchar(45) NOT NULL,
 	last_name varchar(45) not NULL,
 	store_id int2 NOT null,
+	last_update timestamp not null,
 	deleted timestamp null
 );
 
@@ -250,11 +252,13 @@ as $$
 			first_name,
 			last_name,
 			store_id,
+			last_update,
 			deleted)
 		select staff_id,
 			first_name,
 			last_name,
 			store_id,
+			last_update,
 			deleted
 		from film_src.staff
 		where last_update >= last_update_dt
@@ -336,6 +340,7 @@ drop table if exists core.fact_rental;
 drop table if exists core.dim_date;
 drop table if exists core.dim_inventory;
 drop table if exists core.dim_staff;
+drop table if exists core.dim_date;
 
 create table core.dim_date
 (
@@ -391,12 +396,15 @@ create table core.dim_inventory(
 
 create table core.dim_staff(
 	staff_pk serial primary key,
-	staff_id int not null unique,
+	staff_id int not null, -- unique,
 	first_name varchar(45) not null,
 	last_name varchar(45) not null,
 	address varchar(50) not null,
 	district varchar(20) not null,
-	city_name varchar(50) not null
+	city_name varchar(50) not null,
+	effective_date_from timestamp not null,
+	effective_date_to timestamp not null,
+	is_active boolean not null
 );	
 
 create table core.fact_payment(
@@ -574,12 +582,28 @@ $$ language plpgsql;
 create or replace procedure core.load_staff()
 as $$
 	begin
-		delete from core.dim_staff
-		where staff_id in 
-			(select staff_id
-			from staging.staff
-			where deleted is not null);
-	
+--		delete from core.dim_staff
+--		where staff_id in 
+--			(select staff_id
+--			from staging.staff
+--			where deleted is not null);
+--		Помечаем удаленные записи
+		update core.dim_staff ds
+		set is_active = false,
+			effective_date_to = s.deleted
+		from staging.staff s
+		where ds.staff_id = s.staff_id
+			and s.deleted is not null
+			and ds.is_active is true;
+
+--		Получаем список идентификаторов новых сотрудников
+		create temporary table new_staff_id_list on commit drop as
+		select s.staff_id
+		from staging.staff s
+			left join core.dim_staff ds using(staff_id)
+		where ds.staff_id is null;
+
+--		добавляем новых сотрудников в измерение core.dim_staff	
 		insert
 			into
 			core.dim_staff(
@@ -588,24 +612,73 @@ as $$
 			last_name,
 			address,
 			district,
-			city_name)
+			city_name,
+			effective_date_from,
+			effective_date_to,
+			is_active)
 		select s.staff_id,
 			s.first_name,
 			s.last_name,
 			a.address,
 			a.district,
-			c.city
+			c.city,
+			'1900-01-01'::date as effective_date_from,
+			coalesce(s.deleted, '9999-01-01'::date) as effective_date_to,
+			true as is_active
 		from staging.staff s
 			join staging.store sr using(store_id)
 			join staging.address a using(address_id)
 			join staging.city c using(city_id)
-		where deleted is null
-		on conflict (staff_id) do update
-		set first_name = excluded.first_name,
-			last_name = excluded.last_name,
-			address = excluded.address,
-			district = excluded.district,
-			city_name = excluded.city_name;
+			join new_staff_id_list nst using(staff_id);
+--		where deleted is null
+--		on conflict (staff_id) do update
+--		set first_name = excluded.first_name,
+--			last_name = excluded.last_name,
+--			address = excluded.address,
+--			district = excluded.district,
+--			city_name = excluded.city_name;
+
+--		помечаем записи с измененными сотрудниками неактивными
+		update core.dim_staff ds
+		set is_active = false,
+			effective_date_to = s.last_update
+		from staging.staff s
+			left join new_staff_id_list nsil using(staff_id)
+		where s.staff_id = ds.staff_id
+			and ds.is_active = true
+			and nsil.staff_id is null
+			and s.deleted is null;
+
+--		по измененным сотрудникам добавляем актуальные записи
+		insert
+			into
+			core.dim_staff(
+			staff_id,
+			first_name,
+			last_name,
+			address,
+			district,
+			city_name,
+			effective_date_from,
+			effective_date_to,
+			is_active)
+		select s.staff_id,
+			s.first_name,
+			s.last_name,
+			a.address,
+			a.district,
+			c.city,
+			s.last_update as effective_date_from,
+			'9999-01-01'::date as effective_date_to,
+			true as is_active
+		from staging.staff s
+			join staging.store sr using(store_id)
+			join staging.address a using(address_id)
+			join staging.city c using(city_id)
+			left join new_staff_id_list nst using(staff_id)
+		where nst.staff_id is null
+			and s.deleted is null;
+
 	end;
 $$ language plpgsql;
 
@@ -754,19 +827,20 @@ as $$
 		call core.load_payment();
 		call core.load_rental();
 
-		call report.sales_date_calc();
-		call report.sales_film_calc();
+--		call report.sales_date_calc();
+--		call report.sales_film_calc();
 	end;
 $$ language plpgsql;
 
---call core.load_date('2007-01-01'::date, 7000);
+call core.load_date('2007-01-01'::date, 7000);
 call core.full_load();
---
---
---select * from core.dim_staff; 
---select * from staging.staff s;
+
+
+select * from core.dim_staff; 
+select * from staging.staff s;
 select * from staging.last_update;
 --
-select * from core.dim_inventory di order by inventory_id;  --film_id = 2
---select count(*) from core.dim_inventory di;  --4587
-select * from staging.inventory i;
+--select * from core.dim_inventory di order by inventory_id desc;  --film_id = 2
+--select count(*) from core.dim_inventory di;  --4591
+--select * from core.fact_rental fr order by rental_id desc;  
+--select * from core.dim_staff ;
