@@ -96,6 +96,8 @@ CREATE TABLE staging.store (
 
 create or replace procedure staging.film_load()
  as $$
+ 	declare 
+ 		current_update_dt timestamp = now();
 	begin
 		delete from staging.film;
 
@@ -131,6 +133,16 @@ create or replace procedure staging.film_load()
 			fulltext
 		from
 			film_src.film;
+		
+		INSERT INTO staging.last_update
+		(
+			table_name, 
+			update_dt
+		)
+		VALUES(
+			'staging.film', 
+			current_update_dt
+		);
 	end;
 $$ language plpgsql;
 
@@ -138,6 +150,7 @@ create or replace procedure staging.inventory_load()
 as $$
 	declare 
 		last_update_dt timestamp;
+	current_update_dt timestamp = now();
 	begin
 		last_update_dt = coalesce( 
 			(
@@ -181,7 +194,7 @@ as $$
 		)
 		VALUES(
 			'staging.inventory', 
-			now()
+			current_update_dt
 		);
 
 	end;
@@ -244,6 +257,7 @@ create or replace procedure staging.staff_load()
 as $$
 	declare 
 		last_update_dt timestamp;
+		current_update_dt timestamp = now();
 	begin 
 		last_update_dt = coalesce( 
 			(
@@ -288,7 +302,7 @@ as $$
 		)
 		VALUES(
 			'staging.staff', 
-			now()
+			current_update_dt
 		);
 	end;
 $$ language plpgsql;
@@ -501,6 +515,8 @@ $$ language plpgsql;
 
 create or replace procedure core.load_inventory()
 as $$
+	declare 
+		film_prev_update timestamp;
 	begin 
 		--  помечаем удаленные записи
 		update core.dim_inventory i
@@ -606,7 +622,89 @@ as $$
 		where 
 			idl.inventory_id is null
 			and i.deleted is null;
-
+		
+		
+		-- Историчность по таблице Film
+		
+		-- получаем время предыдущей загрузки данных в staging.film, чтобы получить измененные фильмы
+		film_prev_update = (
+			with lag_update as (
+				select
+					lag(lu.update_dt) over(order by lu.update_dt) lag_update_dt
+				from
+					staging.last_update lu 
+				where 
+					lu.table_name = 'staging.film'
+			)
+			select max(lag_update_dt) from lag_update
+		);
+	
+		-- получаем список измененных фильмов с момента предыдущей загрузки
+		create temporary table updated_films on commit drop as
+		select 
+			f.film_id,
+			f.title,
+			f.rental_duration,
+			f.rental_rate,
+			f.length,
+			f.rating,
+			f.last_update 
+		from 
+			staging.film f 
+		where f.last_update >= film_prev_update;
+		
+		-- строки в dim_inventory, которые необходимо поменять
+		create temporary table dim_inventory_rows_to_update on commit drop as 
+		select
+			di.inventory_pk,
+			uf.last_update
+		from 
+			core.dim_inventory di 
+			join updated_films uf
+				on uf.film_id = di.film_id
+				and uf.last_update > di.effective_date_from 
+				and uf.last_update < di.effective_date_to;
+			
+		-- вставляем строки с новыми значинями фильмов
+		insert into core.dim_inventory
+		(
+			inventory_id,
+			film_id,
+			title,
+			rental_duration,
+			rental_rate,
+			length,
+			rating,
+			effective_date_from,
+			effective_date_to,
+			is_active 
+		)
+		select 
+			di.inventory_id,
+			di.film_id,
+			uf.title,
+			uf.rental_duration,
+			uf.rental_rate,
+			uf.length,
+			uf.rating,
+			uf.last_update as effective_date_from,
+			di.effective_date_to,
+			di.is_active 
+		from 
+			core.dim_inventory di
+			join dim_inventory_rows_to_update ru
+				on di.inventory_pk = ru.inventory_pk
+			join updated_films uf
+				on di.film_id = uf.film_id;
+		
+		-- устанавливаем дату окончания действия строк для предыдущих параметров фильмов
+		update core.dim_inventory di
+		set
+			effective_date_to = ru.last_update,
+			is_active = false
+		from 
+			dim_inventory_rows_to_update ru
+		where ru.inventory_pk = di.inventory_pk;
 	end;
 $$ language plpgsql;
 
@@ -882,7 +980,6 @@ as $$
 		call staging.city_load();
 		call staging.store_load();
 		
-		
 		call core.fact_delete();
 		call core.load_inventory();
 		call core.load_staff();
@@ -897,4 +994,13 @@ $$ language plpgsql;
 
 call core.load_date('2007-01-01'::date, 5843);
 call full_load();
+
+
+--select * from core.dim_inventory di where di.inventory_id = 4581 order by di.inventory_pk desc;
+
+--select * from core.dim_inventory di where di.film_id = 999 order by di.inventory_pk desc; 
+--select * from core.dim_inventory di where di.film_id = 998 order by di.inventory_pk desc; 
+
+
+select * from core.dim_inventory di order by inventory_pk desc;
 
