@@ -1,3 +1,8 @@
+
+-- alter table film_src.rental add column deleted timestamp OPTIONS(column_name 'deleted');
+
+
+
 -- создание staging слоя
 -- создание таблиц staging слоя
 
@@ -44,7 +49,9 @@ create table staging.rental (
 	inventory_id int4 not null,
 	customer_id int2 not null,
 	return_date timestamp null,
-	staff_id int2 not null
+	staff_id int2 not null,
+	last_update timestamp not null,
+	deleted timestamp
 );
 
 drop table if exists staging.payment;
@@ -94,10 +101,40 @@ CREATE TABLE staging.store (
 
 -- создание процедур загрузки данных в staging слой
 
-create or replace procedure staging.film_load()
+create or replace function staging.get_last_update_table(table_name varchar) returns timestamp
+as $$
+	begin
+		return coalesce( 
+			(
+				select
+					max(update_dt)
+				from
+					staging.last_update lu
+				where 
+					lu.table_name = get_last_update_table.table_name
+			),
+			'1900-01-01'::date	
+		);
+	end;
+$$ language plpgsql;
+
+create or replace procedure staging.set_table_load_time(table_name varchar, current_update_dt timestamp default now())
+as $$
+	begin
+		INSERT INTO staging.last_update
+		(
+			table_name, 
+			update_dt
+		)
+		VALUES(
+			table_name, 
+			current_update_dt
+		);
+	end;
+$$ language plpgsql;
+
+create or replace procedure staging.film_load(current_update_dt timestamp)
  as $$
- 	declare 
- 		current_update_dt timestamp = now();
 	begin
 		delete from staging.film;
 
@@ -134,35 +171,16 @@ create or replace procedure staging.film_load()
 		from
 			film_src.film;
 		
-		INSERT INTO staging.last_update
-		(
-			table_name, 
-			update_dt
-		)
-		VALUES(
-			'staging.film', 
-			current_update_dt
-		);
+		call staging.set_table_load_time('staging.film', current_update_dt);
 	end;
 $$ language plpgsql;
 
-create or replace procedure staging.inventory_load()
+create or replace procedure staging.inventory_load(current_update_dt timestamp)
 as $$
 	declare 
 		last_update_dt timestamp;
-	current_update_dt timestamp = now();
 	begin
-		last_update_dt = coalesce( 
-			(
-				select
-					max(update_dt)
-				from
-					staging.last_update
-				where 
-					table_name = 'staging.inventory'
-			),
-			'1900-01-01'::date	
-		);
+		last_update_dt = staging.get_last_update_table('staging.inventory');
 		
 		delete from staging.inventory;
 
@@ -187,22 +205,18 @@ as $$
 			i.last_update >= last_update_dt
 			or i.deleted >= last_update_dt;
 		
-		INSERT INTO staging.last_update
-		(
-			table_name, 
-			update_dt
-		)
-		VALUES(
-			'staging.inventory', 
-			current_update_dt
-		);
+		call staging.set_table_load_time('staging.inventory', current_update_dt);
 
 	end;
 $$ language plpgsql;
 
-create or replace procedure staging.rental_load()
+create or replace procedure staging.rental_load(current_update_dt timestamp)
 as $$
+	declare 
+		last_update_dt timestamp;
 	begin
+		last_update_dt = staging.get_last_update_table('staging.rental');
+	
 		delete from staging.rental;
 
 		insert into staging.rental
@@ -212,7 +226,9 @@ as $$
 			inventory_id, 
 			customer_id, 
 			return_date, 
-			staff_id
+			staff_id,
+			last_update,
+			deleted
 		)
 		select 
 			rental_id, 
@@ -220,9 +236,16 @@ as $$
 			inventory_id, 
 			customer_id, 
 			return_date, 
-			staff_id
+			staff_id,
+			last_update,
+			deleted
 		from
-			film_src.rental;
+			film_src.rental
+		where 
+			deleted >= last_update_dt
+			or last_update >= last_update_dt;
+		
+		call staging.set_table_load_time('staging.rental', current_update_dt);
 	end;
 
 $$ language plpgsql;
@@ -253,23 +276,12 @@ as $$
 	end;
 $$ language plpgsql;
 
-create or replace procedure staging.staff_load()
+create or replace procedure staging.staff_load(current_update_dt timestamp)
 as $$
 	declare 
 		last_update_dt timestamp;
-		current_update_dt timestamp = now();
 	begin 
-		last_update_dt = coalesce( 
-			(
-				select
-					max(update_dt)
-				from
-					staging.last_update
-				where 
-					table_name = 'staging.staff'
-			),
-			'1900-01-01'::date	
-		);
+		last_update_dt = staging.get_last_update_table('staging.staff');
 		
 		delete from staging.staff;
 	
@@ -295,15 +307,7 @@ as $$
 			s.last_update >= last_update_dt
 			or s.deleted >= last_update_dt;
 		
-		INSERT INTO staging.last_update
-		(
-			table_name, 
-			update_dt
-		)
-		VALUES(
-			'staging.staff', 
-			current_update_dt
-		);
+		call staging.set_table_load_time('staging.staff', current_update_dt);
 	end;
 $$ language plpgsql;
 
@@ -457,8 +461,9 @@ create table core.fact_rental (
 	staff_fk integer not null references core.dim_staff(staff_pk),
 	rental_date_fk integer not null references core.dim_date(date_dim_pk),
 	return_date_fk integer references core.dim_date(date_dim_pk),
-	cnt int2 not null,
-	amount numeric(7,2)
+	effective_date_from timestamp not null,
+	effective_date_to timestamp not null,
+	is_active boolean not null
 );
 
 create or replace procedure core.load_date(sdate date, nm integer)
@@ -566,7 +571,7 @@ as $$
 			f.rating,
 			'1900-01-01'::date as effective_date_from,
 			coalesce(i.deleted, '9999-01-01'::date) as effective_date_to,
-			true as is_active 
+			i.deleted is null as is_active 
 		from
 			staging.inventory i
 			join staging.film f using(film_id)
@@ -755,7 +760,7 @@ as $$
 			ct.city as city_name,
 			'1900-01-01'::date as effective_date_from,
 			coalesce(s.deleted, '9999-01-01'::date) as effective_date_to,
-			true as is_active 
+			s.deleted is null as is_active 
 		from
 			new_staff_id_list ns
 			join staging.staff s on s.staff_id = ns.staff_id
@@ -848,8 +853,30 @@ $$ language plpgsql;
 create or replace procedure core.load_rental()
 as $$
 	begin 
-		delete from core.fact_rental;
+		-- отмечаем, что удаленные строки более не активны
+		update core.fact_rental r
+		set
+			is_active = false,
+			effective_date_to = sr.deleted 
+		from 
+			staging.rental sr
+		where 
+			sr.rental_id = r.rental_id 
+			and sr.deleted is not null
+			and r.is_active is true;
 	
+		-- получаем список идентификаторов новых фактов сдачи в аренду
+		create temporary table new_rental_id_list on commit drop as 
+		select
+			r.rental_id 
+		from
+			staging.rental r
+			left join core.fact_rental dr using(rental_id)
+		where 
+			dr.rental_id is null;
+		
+		
+		-- вставляем новые факты сдачи в аренду
 		insert into core.fact_rental
 		(
 			rental_id,
@@ -857,8 +884,9 @@ as $$
 			staff_fk,
 			rental_date_fk,
 			return_date_fk,
-			amount,
-			cnt
+			effective_date_from,
+			effective_date_to,
+			is_active
 		)
 		select
 			r.rental_id,
@@ -866,8 +894,96 @@ as $$
 			s.staff_pk as staff_fk,
 			dt_rental.date_dim_pk as rental_date_fk,
 			dt_return.date_dim_pk as return_date_fk,
-			sum(p.amount) as amount,
-			count(*) as cnt
+			r.last_update as effective_date_from,
+			coalesce(r.deleted, '9999-01-01'::date) as effective_date_to,
+			r.deleted is null as is_active
+		from
+			new_rental_id_list idl
+			join staging.rental r
+				on idl.rental_id = r.rental_id 
+			join core.dim_inventory i 
+				on r.inventory_id = i.inventory_id 
+				and r.rental_date between i.effective_date_from and i.effective_date_to 
+			join core.dim_staff s 
+				on s.staff_id = r.staff_id
+				and r.rental_date between s.effective_date_from and s.effective_date_to 
+			join core.dim_date dt_rental on dt_rental.date_actual = r.rental_date::date
+			left join core.dim_date dt_return on dt_return.date_actual = r.return_date::date;
+
+		
+		-- получаем список фактов сдачи в аренду, по которым была только проставлена дата возврата
+		create temporary table update_return_date_id_list on commit drop as
+		select
+			r.rental_id
+		from 
+			staging.rental r 
+			join core.fact_rental fr using(rental_id)
+			join core.dim_inventory di on fr.inventory_fk = di.inventory_pk 
+			join core.dim_staff ds on ds.staff_pk = fr.staff_fk 
+			join core.dim_date dd on fr.rental_date_fk = dd.date_dim_pk 
+			left join new_rental_id_list idl on idl.rental_id = r.rental_id 
+		where 
+			r.return_date is not null
+			and fr.return_date_fk is null
+			and fr.is_active is true
+			and di.inventory_id = r.inventory_id 
+			and ds.staff_id = r.staff_id 
+			and dd.date_actual = r.rental_date::date
+			and r.deleted is null
+			and idl.rental_id is null;
+			
+		
+		-- проставляем дату возврата у фактов сдачи в аренду, у которых была только проставлена дата возврата
+		update core.fact_rental r
+		set 
+			return_date_fk = rd.date_dim_pk 
+		from 
+			staging.rental sr
+			join update_return_date_id_list uidl using(rental_id)
+			join core.dim_date rd on rd.date_actual = sr.return_date::date
+		where 
+			r.rental_id = sr.rental_id 
+			and r.is_active is true;
+		
+		
+		-- помечаем измененные факты сдачи в аренду не активными
+		update core.fact_rental r
+		set
+			is_active = false,
+			effective_date_to = sr.last_update 
+		from
+			staging.rental sr
+			left join update_return_date_id_list uidl using(rental_id)
+			left join new_rental_id_list idl using(rental_id)
+		where 
+			sr.rental_id = r.rental_id 
+			and r.is_active is true
+			and uidl.rental_id is null
+			and idl.rental_id is null
+			and sr.deleted is null;
+		
+		
+		-- по измененным фактам сдачи в аренду добавляем новые актуальные строки
+		insert into core.fact_rental
+		(
+			rental_id,
+			inventory_fk,
+			staff_fk,
+			rental_date_fk,
+			return_date_fk,
+			effective_date_from,
+			effective_date_to,
+			is_active
+		)
+		select
+			r.rental_id,
+			i.inventory_pk as inventory_fk,
+			s.staff_pk as staff_fk,
+			dt_rental.date_dim_pk as rental_date_fk,
+			dt_return.date_dim_pk as return_date_fk,
+			r.last_update as effective_date_from,
+			'9999-01-01'::date as effective_date_to,
+			true as is_active
 		from
 			staging.rental r
 			join core.dim_inventory i 
@@ -877,26 +993,16 @@ as $$
 				on s.staff_id = r.staff_id
 				and r.rental_date between s.effective_date_from and s.effective_date_to 
 			join core.dim_date dt_rental on dt_rental.date_actual = r.rental_date::date
-			left join staging.payment p using (rental_id)
 			left join core.dim_date dt_return on dt_return.date_actual = r.return_date::date
-		group by
-			r.rental_id,
-			i.inventory_pk,
-			s.staff_pk,
-			dt_rental.date_dim_pk,
-			dt_return.date_dim_pk;
-
-	end
+			left join new_rental_id_list idl on r.rental_id = idl.rental_id
+			left join update_return_date_id_list uidl on r.rental_id = uidl.rental_id
+		where
+			r.deleted is null
+			and idl.rental_id is null
+			and uidl.rental_id is null;
+	end;
 $$ language plpgsql;
 
-
-create or replace procedure core.fact_delete()
-as $$
-	begin
-		delete from core.fact_payment;
-		delete from core.fact_rental;
-	end
-$$ language plpgsql;
 
 -- создание data mart слоя
 
@@ -970,17 +1076,18 @@ $$ language plpgsql;
 
 create or replace procedure full_load()
 as $$
+	declare 
+ 		current_update_dt timestamp = now();
 	begin
-		call staging.film_load();
-		call staging.inventory_load();
-		call staging.rental_load();
+		call staging.film_load(current_update_dt);
+		call staging.inventory_load(current_update_dt);
+		call staging.rental_load(current_update_dt);
 		call staging.payment_load();
-		call staging.staff_load();
+		call staging.staff_load(current_update_dt);
 		call staging.address_load();
 		call staging.city_load();
 		call staging.store_load();
 		
-		call core.fact_delete();
 		call core.load_inventory();
 		call core.load_staff();
 		call core.load_payment();
@@ -992,15 +1099,13 @@ as $$
 $$ language plpgsql;
 
 
-call core.load_date('2007-01-01'::date, 5843);
+call core.load_date('2005-01-01'::date, 6573);
 call full_load();
 
+--select count(*) from core.fact_rental fr 
+--select count(*) from staging.rental r;
 
---select * from core.dim_inventory di where di.inventory_id = 4581 order by di.inventory_pk desc;
+--select * from core.fact_rental fr order by rental_pk desc;
 
---select * from core.dim_inventory di where di.film_id = 999 order by di.inventory_pk desc; 
---select * from core.dim_inventory di where di.film_id = 998 order by di.inventory_pk desc; 
-
-
-select * from core.dim_inventory di order by inventory_pk desc;
+--select * from core.fact_rental fr where rental_id in (16170, 16171);
 
